@@ -43,32 +43,6 @@ void BroadcastClientList()
     }
 }
 
-void SessionSender(Session* session, shared_ptr<tcp::socket> sock, shared_ptr<mutex> writeMx)
-{
-    int id = session->sessionID;
-    SocketTransport tr(*sock, *writeMx);
-
-    while (true)
-    {
-        Message m;
-        if (session->getMessage(m))
-        {
-            if (m.header.messageType == MT_CLOSE)
-                break; // Команда на завершение потока
-
-            try { m.send(tr); }
-            catch (...) { break; } // Если сеть отвалилась
-        }
-        else
-        {
-            // Если сообщений долго нет, проверяем, жива ли еще сессия
-            lock_guard<mutex> lg(SRLocal::mx);
-            if (SRLocal::sessions_map.find(id) == SRLocal::sessions_map.end())
-                break;
-        }
-    }
-}
-
 void ClientWorker(shared_ptr<tcp::socket> sock)
 {
     int clientId;
@@ -81,10 +55,6 @@ void ClientWorker(shared_ptr<tcp::socket> sock)
         Session* s = new Session(clientId, clientName);
         s->setSocket(sock);
         SRLocal::sessions_map[clientId] = s;
-
-        // Запускаем поток-писатель в современном стиле C++
-        thread t(SessionSender, s, sock, writeMx);
-        t.detach();
     }
 
     SafeWrite("Client", clientId, "connected.");
@@ -109,29 +79,26 @@ void ClientWorker(shared_ptr<tcp::socket> sock)
             Message m;
             m.receive(tr); // Ожидаем сообщение от клиента
 
+            if (m.header.messageType == MT_GETDATA)
             {
                 lock_guard<mutex> lg(SRLocal::mx);
                 if (SRLocal::sessions_map.find(clientId) != SRLocal::sessions_map.end())
-                    SRLocal::sessions_map[clientId]->updateActivity();
-            }
-
-            if (m.header.messageType == MT_QUIT)
-            {
-                break; // Клиент сам захотел отключиться
-            }
-            else if (m.header.messageType == MT_INFO)
-            {
-                // Регулярный пинг от клиента. Отвечаем ему свежим списком.
-                lock_guard<mutex> lg(SRLocal::mx);
-                wstring currentList;
-                for (auto& pair : SRLocal::sessions_map)
                 {
-                    if (!currentList.empty()) currentList += L';';
-                    currentList += to_wstring(pair.first) + L':' + pair.second->clientName;
+                    SRLocal::sessions_map[clientId]->updateActivity();
+
+                    Message dataMsg;
+                    if (SRLocal::sessions_map[clientId]->getMessage(dataMsg))
+                    {
+                        // Есть сообщение — отправляем его клиенту
+                        dataMsg.send(tr);
+                    }
+                    else
+                    {
+                        // Нет сообщений — отправляем MT_NODATA
+                        Message noData(ADDR_SERVER, MT_NODATA, L"");
+                        noData.send(tr);
+                    }
                 }
-                Message confirm(ADDR_SERVER, MT_CONFIRM, currentList);
-                if (SRLocal::sessions_map.find(clientId) != SRLocal::sessions_map.end())
-                    SRLocal::sessions_map[clientId]->addMessage(confirm);
             }
             else if (m.header.messageType == MT_DATA)
             {
@@ -161,6 +128,10 @@ void ClientWorker(shared_ptr<tcp::socket> sock)
                     }
                 }
             }
+            else if (m.header.messageType == MT_QUIT)
+            {
+                break; // Клиент сам захотел отключиться
+            }
         }
     }
     catch (...) {}
@@ -170,17 +141,7 @@ void ClientWorker(shared_ptr<tcp::socket> sock)
         lock_guard<mutex> lg(SRLocal::mx);
         if (SRLocal::sessions_map.find(clientId) != SRLocal::sessions_map.end())
         {
-            Message closeMsg(ADDR_SERVER, MT_CLOSE, L"");
-            SRLocal::sessions_map[clientId]->addMessage(closeMsg);
-        }
-    }
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-
-    {
-        lock_guard<mutex> lg(SRLocal::mx);
-        if (SRLocal::sessions_map.find(clientId) != SRLocal::sessions_map.end())
-        {
+            SRLocal::sessions_map[clientId]->closeSocket();
             delete SRLocal::sessions_map[clientId];
             SRLocal::sessions_map.erase(clientId);
         }

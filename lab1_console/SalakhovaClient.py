@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """
-SalakhovaClient.py — консольный Python-клиент для протокола Салаховой.
-Только стандартная библиотека (socket, struct, threading, collections).
+SalakhovaClient.py — консольный Python-клиент для протокола Салаховой (pull-модель).
+Только стандартная библиотека (socket, struct, threading).
 """
 
 import socket
 import struct
 import threading
-from collections import deque
-from datetime import datetime
 import sys
+import time
 
 # ── Константы протокола ──────────────────────────────────────────────
 MT_CLOSE   = 0
@@ -19,6 +18,8 @@ MT_STOP    = 3
 MT_QUIT    = 4
 MT_INFO    = 5
 MT_CONFIRM = 6
+MT_GETDATA = 7
+MT_NODATA  = 8
 
 ADDR_BROADCAST = -1
 ADDR_SERVER    = -2
@@ -27,29 +28,49 @@ PORT = 12345
 HEADER_FMT = '<iiii'
 HEADER_SIZE = 16
 
-PING_INTERVAL = 10.0  # секунд между MT_INFO
-POLL_INTERVAL = 0.1   # секунд между опросами inbox в printer-потоке
+POLL_INTERVAL = 1.0  # секунд между MT_GETDATA
+
+
+def parse_clients_payload(payload: str) -> dict:
+    """Парсит payload MT_CONFIRM вида '1:Alice;2:Bob;3:Charlie'.
+    Возвращает словарь {id: name}.
+    """
+    result = {}
+    parts = payload.split(';')
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        if ':' in part:
+            cid, _, name = part.partition(':')
+            try:
+                result[int(cid)] = name
+            except ValueError:
+                pass
+    return result
 
 
 class SalakhovaClient:
-    """Клиент протокола Салаховой — push-модель, только TCP."""
+    """Клиент протокола Салаховой — pull-модель с poll-потоком."""
 
     def __init__(self):
         self.sock = None
-        self.client_id = None       # int ID, полученный от сервера
-        self.alive = False
-        self.inbox = deque()
-        self.inbox_lock = threading.Lock()
+        self.client_id = None
+        self.connected = False
         self.send_lock = threading.Lock()
-        self.clients = {}           # id -> name (строка)
+        self.print_lock = threading.Lock()
+        self.clients = {}
 
-    # ── Публичный API ────────────────────────────────────────────────
+    def _safe_print(self, text: str):
+        """Потокобезопасный вывод (poll-поток и главный поток конкурируют)."""
+        with self.print_lock:
+            print(text)
 
     def connect(self, host: str, port: int = PORT):
         """Подключиться к серверу, выполнить handshake (MT_CONFIRM → client_id)."""
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.connect((host, port))
-        self.alive = True
+        self.connected = True
 
         # Handshake: первое сообщение — MT_CONFIRM с ID клиента
         msg_type, _, _, _, payload = self._recv_message()
@@ -59,23 +80,10 @@ class SalakhovaClient:
             )
         self.client_id = int(payload)
 
-        # Запускаем reader-поток
-        reader = threading.Thread(target=self._reader_loop, daemon=True)
-        reader.start()
-
-    def poll(self):
-        """Извлечь одно сообщение из inbox.
-        Возвращает (source, cmd, target, text) или None.
-        """
-        with self.inbox_lock:
-            if not self.inbox:
-                return None
-            return self.inbox.popleft()
-
     def disconnect(self):
         """Отправить MT_QUIT серверу и закрыть сокет."""
-        if self.alive and self.sock:
-            self.alive = False
+        if self.connected and self.sock:
+            self.connected = False
             try:
                 self._send(ADDR_SERVER, MT_QUIT)
             except OSError:
@@ -84,8 +92,6 @@ class SalakhovaClient:
                 self.sock.close()
             except OSError:
                 pass
-
-    # ── Внутренние методы ────────────────────────────────────────────
 
     def _send(self, target: int, msg_type: int, text: str = ""):
         """Упаковать и отправить сообщение."""
@@ -100,23 +106,11 @@ class SalakhovaClient:
         with self.send_lock:
             self.sock.sendall(header + payload)
 
-    def _reader_loop(self):
-        """Фоновый поток: читать заголовки + payload, класть в inbox."""
-        while self.alive and self.sock:
-            try:
-                msg_type, source, target, payload = self._recv_message()
-                if msg_type is None:
-                    break  # соединение закрыто
-            except (OSError, ConnectionError, struct.error) as exc:
-                if self.alive:
-                    with self.inbox_lock:
-                        self.inbox.append(
-                            (0, MT_CLOSE, 0, f"Соединение потеряно: {exc}")
-                        )
-                break
-
-            with self.inbox_lock:
-                self.inbox.append((source, msg_type, target, payload))
+    def _send_header(self, msg_type: int, size: int, to_addr: int, from_addr: int):
+        """Отправить только заголовок без payload."""
+        header = struct.pack(HEADER_FMT, msg_type, size, to_addr, from_addr)
+        with self.send_lock:
+            self.sock.sendall(header)
 
     def _recv_message(self):
         """Прочитать одно сообщение: 16 байт заголовок + payload.
@@ -157,69 +151,44 @@ class SalakhovaClient:
             remaining -= len(chunk)
         return b''.join(chunks)
 
-
-# ── Вспомогательные функции main() ──────────────────────────────────
-
-def parse_clients_payload(payload: str) -> dict:
-    """Парсит payload MT_CONFIRM вида '1:Alice;2:Bob;3:Charlie'.
-    Возвращает словарь {id: name}.
-    """
-    result = {}
-    parts = payload.split(';')
-    for part in parts:
-        part = part.strip()
-        if not part:
-            continue
-        if ':' in part:
-            cid, _, name = part.partition(':')
+    def poll_loop(self):
+        """Фоновый poll-поток: шлёт MT_GETDATA, принимает MT_DATA/MT_NODATA/MT_CONFIRM."""
+        while self.connected:
             try:
-                result[int(cid)] = name
-            except ValueError:
-                pass
-    return result
+                # Запрашиваем данные
+                self._send_header(MT_GETDATA, 0, ADDR_SERVER, self.client_id)
 
+                # Читаем ответ
+                msg_type, from_addr, to_addr, payload = self._recv_message()
+                if msg_type is None:
+                    self.connected = False
+                    break
 
-def format_timestamp() -> str:
-    return datetime.now().strftime('%H:%M:%S')
+                if msg_type == MT_DATA:
+                    sender = from_addr
+                    name = self.clients.get(sender, f"#{sender}")
+                    self._safe_print(f"\n[From Client #{sender} ({name})]: {payload}")
 
+                elif msg_type == MT_CONFIRM:
+                    if payload and (';' in payload or ':' in payload):
+                        self.clients.update(parse_clients_payload(payload))
+                        self._safe_print(f"\n[Clients updated: {len(self.clients)} online]")
 
-def printer_loop(client: SalakhovaClient):
-    """Фоновый поток: читает из inbox и выводит сообщения."""
-    while client.alive:
-        msg = client.poll()
-        if msg is None:
-            threading.Event().wait(POLL_INTERVAL)
-            continue
+                elif msg_type == MT_NODATA:
+                    pass  # Данных нет, просто ждём
 
-        source, cmd, target, text = msg
+                elif msg_type == MT_CLOSE:
+                    self._safe_print(f"\n⚠ Соединение закрыто сервером: {payload}")
+                    self.connected = False
+                    break
 
-        if cmd == MT_DATA:
-            ts = format_timestamp()
-            if source == ADDR_SERVER:
-                print(f"[{ts}] <сервер>: {text}")
-            else:
-                name = client.clients.get(source, f"#{source}")
-                print(f"[{ts}] {name}: {text}")
+                time.sleep(POLL_INTERVAL)
 
-        elif cmd == MT_CONFIRM:
-            if text and (';' in text or ':' in text):
-                client.clients.update(parse_clients_payload(text))
-            # Если это просто ID (handshake) — игнорируем, ID уже сохранён
-
-        elif cmd == MT_CLOSE:
-            print(f"⚠ {text}")
-            client.alive = False
-            break
-
-
-def ping_loop(client: SalakhovaClient):
-    """Фоновый поток: каждые 10 сек отправляет MT_INFO серверу."""
-    while client.alive:
-        try:
-            client._send(ADDR_SERVER, MT_INFO)
-        except OSError:
-            break
-        threading.Event().wait(PING_INTERVAL)
+            except (OSError, ConnectionError, struct.error) as exc:
+                if self.connected:
+                    self._safe_print(f"\n⚠ Соединение потеряно: {exc}")
+                self.connected = False
+                break
 
 
 def main():
@@ -239,19 +208,13 @@ def main():
     print(f"Подключено как #{client.client_id}")
     print("Команды: /list, /send <id|all> <текст>, /quit")
 
-    # Поток пинга
-    ping_thread = threading.Thread(target=ping_loop, args=(client,), daemon=True)
-    ping_thread.start()
-
-    # Поток вывода
-    printer_thread = threading.Thread(
-        target=printer_loop, args=(client,), daemon=True
-    )
-    printer_thread.start()
+    # Запускаем poll-поток
+    poll_thread = threading.Thread(target=client.poll_loop, daemon=True)
+    poll_thread.start()
 
     # Основной цикл ввода команд
     try:
-        while client.alive:
+        while client.connected:
             try:
                 line = input().strip()
             except (EOFError, KeyboardInterrupt):
@@ -278,7 +241,6 @@ def main():
                     print("Использование: /send <id|all> <текст>")
                     continue
 
-                # Первое слово — id или all, остальное — текст
                 parts = rest.split(maxsplit=1)
                 target_str = parts[0]
                 text = parts[1] if len(parts) > 1 else ""

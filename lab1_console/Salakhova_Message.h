@@ -6,13 +6,15 @@ using namespace std;
 
 enum MessageTypes
 {
-    MT_CLOSE,
-    MT_DATA,
-    MT_START,
-    MT_STOP,
-    MT_QUIT,
-    MT_INFO,
-    MT_CONFIRM
+    MT_CLOSE,    // 0
+    MT_DATA,     // 1
+    MT_START,    // 2
+    MT_STOP,     // 3
+    MT_QUIT,     // 4
+    MT_INFO,     // 5
+    MT_CONFIRM,  // 6
+    MT_GETDATA,  // 7 — клиент запрашивает данные у брокера
+    MT_NODATA    // 8 — брокер отвечает: данных нет
 };
 
 // Специальные адресаты

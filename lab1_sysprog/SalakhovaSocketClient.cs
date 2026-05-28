@@ -1,9 +1,7 @@
 using System;
-using System.Collections.Generic;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
-using System.Threading;
 
 namespace Salakhova_Sharp
 {
@@ -18,6 +16,10 @@ namespace Salakhova_Sharp
     ///   [12..15]- from (int)         — ID отправителя
     /// 
     /// Payload: UTF-16LE кодировка (Encoding.Unicode)
+    /// 
+    /// Модель: pull/broker — данные запрашиваются вызовом GetData(),
+    /// который отправляет MT_GETDATA серверу и читает один ответ.
+    /// Нет фонового потока чтения (ReaderLoop/push-модель удалена).
     /// </summary>
     public class SalakhovaSocketClient
     {
@@ -29,24 +31,23 @@ namespace Salakhova_Sharp
         public const int MT_QUIT    = 4;
         public const int MT_INFO    = 5;
         public const int MT_CONFIRM = 6;
+        public const int MT_GETDATA = 7;
+        public const int MT_NODATA  = 8;
 
         public const int ADDR_BROADCAST = -1;
         public const int ADDR_SERVER    = -2;
 
         private const int HeaderSize = 16;
         private const int DefaultPort = 12345;
+        private const int ReceiveTimeoutMs = 5000;
 
         // --- Поля состояния ---
         private Socket socket;
         private int clientId;
         private volatile bool isConnected;
-        private Thread readerThread;
 
         // --- Синхронизация ---
         private readonly object writeLock = new object();
-        private readonly object inboxLock = new object();
-        private readonly Queue<(int source, int command, int target, string text)> inbox =
-            new Queue<(int source, int command, int target, string text)>();
 
         // --- Публичные свойства ---
         public bool IsConnected => isConnected;
@@ -59,7 +60,8 @@ namespace Salakhova_Sharp
         /// <summary>
         /// Подключение к серверу Салаховой.
         /// После TCP-рукопожатия читает первый MT_CONFIRM для получения clientId.
-        /// Затем запускает фоновый поток чтения (ReaderLoop).
+        /// Фоновый поток чтения НЕ запускается — данные запрашиваются через GetData().
+        /// Устанавливается ReceiveTimeout на сокете для предотвращения зависаний.
         /// </summary>
         public bool Connect(string host, int port = DefaultPort)
         {
@@ -70,6 +72,9 @@ namespace Salakhova_Sharp
             {
                 socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
                 socket.Connect(host, port);
+
+                // Устанавливаем таймаут чтения, чтобы не зависнуть навсегда
+                socket.ReceiveTimeout = ReceiveTimeoutMs;
 
                 // --- Читаем первый MT_CONFIRM (handshake) ---
                 byte[] headerBuf = ReadExact(HeaderSize);
@@ -95,15 +100,7 @@ namespace Salakhova_Sharp
                     return false;
                 }
 
-                // --- Запускаем фоновый поток чтения ---
                 isConnected = true;
-                readerThread = new Thread(ReaderLoop)
-                {
-                    IsBackground = true,
-                    Name = "SalakhovaReader"
-                };
-                readerThread.Start();
-
                 return true;
             }
             catch
@@ -143,19 +140,13 @@ namespace Salakhova_Sharp
             }
 
             CleanupSocket();
-
-            if (readerThread != null && readerThread.IsAlive)
-            {
-                readerThread.Join(2000);
-                readerThread = null;
-            }
         }
 
         /// <summary>
         /// Отправка сообщения серверу.
         /// </summary>
         /// <param name="target">ADDR_BROADCAST, ADDR_SERVER или ID клиента</param>
-        /// <param name="messageType">Тип сообщения (MT_DATA, MT_INFO, MT_QUIT и т.д.)</param>
+        /// <param name="messageType">Тип сообщения (MT_DATA, MT_QUIT и т.д.)</param>
         /// <param name="text">Текст сообщения (может быть пустым)</param>
         public void Send(int target, int messageType, string text)
         {
@@ -179,64 +170,64 @@ namespace Salakhova_Sharp
         }
 
         /// <summary>
-        /// Неблокирующее чтение одного сообщения из очереди входящих.
+        /// Синхронный запрос одного сообщения от сервера (pull-модель).
+        /// Отправляет MT_GETDATA и читает один ответ.
         /// </summary>
-        /// <returns>true, если сообщение доступно</returns>
-        public bool Poll(out int source, out int command, out int target, out string text)
+        /// <param name="source">ID отправителя (from)</param>
+        /// <param name="command">Тип сообщения (MT_DATA, MT_CONFIRM и т.д.)</param>
+        /// <param name="target">Адресат (to)</param>
+        /// <param name="text">Текст payload (может быть пустым)</param>
+        /// <returns>true если есть данные (MT_DATA или MT_CONFIRM), false если данных нет (MT_NODATA)</returns>
+        public bool GetData(out int source, out int command, out int target, out string text)
         {
-            lock (inboxLock)
-            {
-                if (inbox.Count > 0)
-                {
-                    var msg = inbox.Dequeue();
-                    source  = msg.source;
-                    command = msg.command;
-                    target  = msg.target;
-                    text    = msg.text;
-                    return true;
-                }
-            }
-
             source  = 0;
             command = 0;
             target  = 0;
             text    = null;
-            return false;
-        }
 
-        // ====================================================================
-        //  ЧТЕНИЕ (ReaderLoop)
-        // ====================================================================
+            if (!isConnected)
+                return false;
 
-        /// <summary>
-        /// Фоновый поток: циклически читает заголовки + payload и складирует в очередь inbox.
-        /// </summary>
-        private void ReaderLoop()
-        {
             try
             {
-                while (isConnected)
+                // 1. Отправляем MT_GETDATA серверу (без payload)
+                byte[] headerReq = PackHeader(MT_GETDATA, 0, ADDR_SERVER, clientId);
+
+                lock (writeLock)
                 {
-                    byte[] headerBuf = ReadExact(HeaderSize);
-                    var (messageType, size, to, from) = UnpackHeader(headerBuf);
-
-                    string text = "";
-                    if (size > 0)
-                    {
-                        byte[] payloadBuf = ReadExact(size);
-                        text = Encoding.Unicode.GetString(payloadBuf);
-                    }
-
-                    lock (inboxLock)
-                    {
-                        inbox.Enqueue((from, messageType, to, text));
-                    }
+                    socket.Send(headerReq, SocketFlags.None);
                 }
+
+                // 2. Читаем заголовок ответа
+                byte[] headerResp = ReadExact(HeaderSize);
+                var (msgType, size, to, from) = UnpackHeader(headerResp);
+
+                // 3. Обрабатываем ответ
+                string payload = "";
+                if (size > 0)
+                {
+                    byte[] payloadBuf = ReadExact(size);
+                    payload = Encoding.Unicode.GetString(payloadBuf);
+                }
+
+                command = msgType;
+                source  = from;
+                target  = to;
+                text    = payload;
+
+                if (msgType == MT_NODATA)
+                {
+                    return false;
+                }
+
+                // MT_DATA, MT_CONFIRM и любые другие — возвращаем true
+                return true;
             }
             catch
             {
                 // При ошибке чтения (разрыв соединения) — помечаем как отключённый
                 isConnected = false;
+                return false;
             }
         }
 
