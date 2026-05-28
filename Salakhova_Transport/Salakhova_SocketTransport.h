@@ -6,17 +6,17 @@
 
 #include <boost/asio.hpp>
 #include <mutex>
-#include "../lab1_console/Salakhova_Interfaces.h"
+#include "../lab1_console/Salakhova_Interfaces.h" // Проверь правильность путей к твоим файлам
+#include "../lab1_console/Salakhova_Message.h"
 
-class SocketTransport : public ITransport
+class __declspec(dllexport) SocketTransport : public ITransport
 {
-    boost::asio::ip::tcp::socket& sock_;
-    std::mutex&                    writeMx_;
+    boost::asio::ip::tcp::socket& sock;
+    std::mutex& writeMx;
 
 public:
-    SocketTransport(boost::asio::ip::tcp::socket& sock, std::mutex& writeMx)
-        : sock_(sock), writeMx_(writeMx) {}
+    SocketTransport(boost::asio::ip::tcp::socket& s, std::mutex& mx);
 
-    virtual void send(Message& m) override;
-    virtual void receive(Message& m) override;
+    virtual void send(Message& m) const override;
+    virtual void receive(Message& m) const override;
 };

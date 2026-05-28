@@ -1,6 +1,5 @@
 #pragma once
 
-#include <windows.h>
 #include <iostream>
 #include <queue>
 #include <vector>
@@ -8,33 +7,22 @@
 #include <thread>
 #include <fstream>
 #include <tchar.h>
-
-using namespace std;
+#include <mutex>
 
 inline void DoWrite()
 {
-    wcout << endl;
+	std::cout << std::endl;
 }
 
 template <class T, typename... Args> inline void DoWrite(T& value, Args... args)
 {
-    wcout << value << L" ";
-    DoWrite(args...);
+	std::cout << value << " ";
+	DoWrite(args...);
 }
 
-static CRITICAL_SECTION cs;
-static bool initCS = true;
+static std::mutex console_mx;
 template<typename... Args> inline void SafeWrite(Args... args)
 {
-    if (initCS)
-    {
-        InitializeCriticalSection(&cs);
-        initCS = false;
-    }
-    EnterCriticalSection(&cs);
-    DoWrite(args...);
-    wcout.clear();
-    LeaveCriticalSection(&cs);
+	std::lock_guard<std::mutex> lock(console_mx);
+	DoWrite(args...);
 }
-
-#pragma warning(disable : 4302 4311 4312 6031)

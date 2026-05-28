@@ -6,18 +6,22 @@ using namespace std;
 
 enum MessageTypes
 {
-    MT_CLOSE   = 0,
-    MT_DATA    = 1,
-    MT_START   = 2,
-    MT_STOP    = 3,
-    MT_QUIT    = 4,
-    MT_INIT    = 5,
-    MT_CONFIRM = 6,
-    MT_NODATA  = 7
+    MT_CLOSE,
+    MT_DATA,
+    MT_START,
+    MT_STOP,
+    MT_QUIT,
+    MT_INFO,
+    MT_CONFIRM
 };
 
-constexpr int SR_ALL    = -1; // всем потокам (broadcast)
-constexpr int SR_BROKER = -2; // серверу
+// Специальные адресаты
+constexpr int ADDR_BROADCAST = -1;  // Отправить всем
+constexpr int ADDR_SERVER    = -2;  // Системное сообщение от/к серверу
+
+// Таймауты (секунды)
+constexpr int SERVER_TIMEOUT_SECONDS    = 30;
+constexpr int SERVER_TIMEOUT_CHECK_SEC  =  5;
 
 struct MessageHeader
 {
@@ -34,12 +38,11 @@ struct Message
 
     Message() = default;
     Message(MessageTypes messageType, const wstring& data = L"");
-    Message(int to, MessageTypes messageType, const wstring& data = L"", int from = 0);
+    Message(int to, MessageTypes messageType, const wstring& data = L"");
 
-    // Strategy Pattern: сообщение делегирует транспортной стратегии
-    void send(ITransport* transport);
-    void receive(ITransport* transport);
+    void send(const ITransport& transport);
+    void receive(const ITransport& transport);
 
-    static void sendMessage(ITransport* transport, int to, MessageTypes messageType, const wstring& data = L"");
-    static Message receiveMessage(ITransport* transport);
+    static void sendMessage(const ITransport& transport, int to, MessageTypes messageType, const wstring& data = L"");
+    static Message receiveMessage(const ITransport& transport);
 };

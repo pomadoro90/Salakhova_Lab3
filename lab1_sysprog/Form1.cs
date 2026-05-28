@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Windows.Forms;
@@ -7,186 +7,188 @@ namespace Salakhova_Sharp
 {
     public partial class Form1 : Form
     {
-        // ===== Импорт функций из DLL =====
-        [DllImport("Salakhova_Transport.dll", CharSet = CharSet.Unicode, CallingConvention = CallingConvention.Cdecl)]
-        private static extern bool Salakhova_Connect(string ip, int port);
+        [DllImport("Salakhova_Transport.dll", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode)]
+        public static extern bool Salakhova_Connect(string host, int port);
 
         [DllImport("Salakhova_Transport.dll", CallingConvention = CallingConvention.Cdecl)]
-        private static extern void Salakhova_Disconnect();
+        public static extern void Salakhova_Disconnect();
 
         [DllImport("Salakhova_Transport.dll", CallingConvention = CallingConvention.Cdecl)]
-        private static extern bool Salakhova_IsConnected();
+        public static extern bool Salakhova_IsConnected();
 
-        [DllImport("Salakhova_Transport.dll", CharSet = CharSet.Unicode, CallingConvention = CallingConvention.Cdecl)]
-        private static extern void Salakhova_Send(int target, int command, string text);
+        [DllImport("Salakhova_Transport.dll", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode)]
+        public static extern void Salakhova_Send(int target, int command, string text);
 
-        [DllImport("Salakhova_Transport.dll", CharSet = CharSet.Unicode, CallingConvention = CallingConvention.Cdecl)]
-        private static extern bool Salakhova_Poll(out int outCommand, out int outTarget, StringBuilder outText, int outCapacity);
+        [DllImport("Salakhova_Transport.dll", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode)]
+        public static extern bool Salakhova_Poll(out int command, out int target, out int source, StringBuilder textBuf, int capacity);
 
-        [DllImport("Salakhova_Transport.dll", CallingConvention = CallingConvention.Cdecl)]
-        private static extern int Salakhova_LastErrorCode();
-
-        // ===== Константы протокола =====
-        const int MT_CLOSE   = 0;
-        const int MT_DATA    = 1;
-        const int MT_START   = 2;
-        const int MT_STOP    = 3;
-        const int MT_QUIT    = 4;
-        const int MT_INIT    = 5;
+        const int MT_CLOSE = 0;
+        const int MT_DATA = 1;
+        const int MT_QUIT = 4;
+        const int MT_INFO = 5;
         const int MT_CONFIRM = 6;
+        const int ADDR_BROADCAST = -1;
+        const int ADDR_SERVER = -2;
+        const int SERVER_TIMEOUT_SECONDS = 30;
+        const int CLIENT_PING_INTERVAL_SEC = 10;
 
-        const int SR_ALL    = -1;
-        const int SR_BROKER = -2;
-
-        // ===== Таймер Poll =====
-        private readonly Timer pollTimer = new Timer { Interval = 100 };
+        private int myId = -1;
+        private System.Windows.Forms.Timer pollTimer;
+        private System.Windows.Forms.Timer pingTimer;
+        private StringBuilder textBuf = new StringBuilder(4096);
 
         public Form1()
         {
             InitializeComponent();
-            UpdateUI(false);
-            cbRecipient.Items.Add("Все клиенты");
-            cbRecipient.SelectedIndex = 0;
+            this.FormClosing += Form1_FormClosing;
+
+            this.Text = "Message Client";
+
+            pollTimer = new System.Windows.Forms.Timer();
+            pollTimer.Interval = 50;
+            pollTimer.Tick += PollTimer_Tick;
+
+            pingTimer = new System.Windows.Forms.Timer();
+            pingTimer.Interval = CLIENT_PING_INTERVAL_SEC * 1000;
+            pingTimer.Tick += PingTimer_Tick;
+
+            ToggleUi(false);
         }
 
-        // ===== Connect =====
+        private void ToggleUi(bool isConnected)
+        {
+            btnConnect.Enabled = !isConnected;
+            btnDisconnect.Enabled = isConnected;
+            btnSend.Enabled = isConnected;
+            comboRecipient.Enabled = isConnected;
+            textBoxMessage.Enabled = isConnected;
+        }
+
         private void btnConnect_Click(object sender, EventArgs e)
         {
-            string ip = string.IsNullOrWhiteSpace(txtIP.Text) ? "127.0.0.1" : txtIP.Text;
-            int port = (int)numericPort.Value;
-
-            try
+            if (Salakhova_Connect("127.0.0.1", 12345))
             {
-                if (!Salakhova_Connect(ip, port))
-                {
-                    int err = Salakhova_LastErrorCode();
-                    MessageBox.Show($"Не удалось подключиться к {ip}:{port}\nКод ошибки: {err}",
-                                    "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                    return;
-                }
-            }
-            catch (Exception ex)
-            {
-                MessageBox.Show($"Ошибка подключения: {ex.Message}", "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                return;
-            }
-
-            pollTimer.Start();
-            UpdateUI(true);
-        }
-
-        // ===== Disconnect =====
-        private void btnDisconnect_Click(object sender, EventArgs e)
-        {
-            pollTimer.Stop();
-            Salakhova_Disconnect();
-            cbRecipient.Items.Clear();
-            cbRecipient.Items.Add("Все клиенты");
-            cbRecipient.SelectedIndex = 0;
-            UpdateUI(false);
-        }
-
-        // ===== Start Thread =====
-        private void btnStart_Click(object sender, EventArgs e)
-        {
-            if (!Salakhova_IsConnected()) return;
-            Salakhova_Send(SR_BROKER, MT_START, "");
-        }
-
-        // ===== Stop Thread =====
-        private void btnStop_Click(object sender, EventArgs e)
-        {
-            if (!Salakhova_IsConnected()) return;
-            Salakhova_Send(SR_BROKER, MT_STOP, "");
-        }
-
-        // ===== Send Message =====
-        private void btnSend_Click(object sender, EventArgs e)
-        {
-            if (!Salakhova_IsConnected()) return;
-            if (string.IsNullOrWhiteSpace(txtMessage.Text)) return;
-
-            int target = cbRecipient.SelectedIndex <= 0 ? SR_ALL : threadIds[cbRecipient.SelectedIndex - 1];
-            Salakhova_Send(target, MT_DATA, txtMessage.Text);
-            txtMessage.Clear();
-        }
-
-        // ===== Poll Timer =====
-        private void PollTimer_Tick(object sender, EventArgs e)
-        {
-            if (!Salakhova_IsConnected())
-            {
-                pollTimer.Stop();
-                Salakhova_Disconnect();
-                UpdateUI(false);
-                MessageBox.Show("Соединение с сервером потеряно.", "Внимание", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                return;
-            }
-
-            StringBuilder sb = new StringBuilder(1024);
-            int cmd, target;
-            while (Salakhova_Poll(out cmd, out target, sb, sb.Capacity))
-            {
-                string text = sb.ToString();
-                switch (cmd)
-                {
-                    case MT_CONFIRM:
-                        ParseThreadList(text);
-                        break;
-
-                    case MT_DATA:
-                        txtOutput.AppendText($"[{DateTime.Now:HH:mm:ss}] {text}\r\n");
-                        break;
-                }
-            }
-        }
-
-        // ===== Парсинг списка потоков из MT_CONFIRM =====
-        private int[] threadIds = new int[0];
-
-        private void ParseThreadList(string text)
-        {
-            if (string.IsNullOrWhiteSpace(text))
-            {
-                threadIds = new int[0];
+                pollTimer.Start();
+                pingTimer.Start();
+                ToggleUi(true);
             }
             else
             {
-                string[] parts = text.Split(',');
-                threadIds = new int[parts.Length];
-                for (int i = 0; i < parts.Length; i++)
-                    int.TryParse(parts[i], out threadIds[i]);
+                MessageBox.Show("Server is not running!", "Connection Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
-
-            cbRecipient.Items.Clear();
-            cbRecipient.Items.Add("Все клиенты");
-            for (int i = 0; i < threadIds.Length; i++)
-                cbRecipient.Items.Add($"Поток {threadIds[i]}");
-            cbRecipient.SelectedIndex = 0;
         }
 
-        // ===== Обновление UI =====
-        private void UpdateUI(bool connected)
+        private void btnDisconnect_Click(object sender, EventArgs e)
         {
-            btnConnect.Enabled    = !connected;
-            btnDisconnect.Enabled = connected;
-            txtIP.Enabled         = !connected;
-            numericPort.Enabled   = !connected;
-            btnStart.Enabled      = connected;
-            btnStop.Enabled       = connected;
-            btnSend.Enabled       = connected;
-            txtMessage.Enabled    = connected;
-            cbRecipient.Enabled   = connected;
+            DisconnectClient();
+        }
 
-            Text = connected
-                ? $"Салахова Lab3 | подключено к {txtIP.Text}:{numericPort.Value}"
-                : "Салахова Lab3 | не подключено";
+        private void btnSend_Click(object sender, EventArgs e)
+        {
+            if (!Salakhova_IsConnected() || string.IsNullOrWhiteSpace(textBoxMessage.Text)) return;
+            if (comboRecipient.SelectedItem == null) return;
+
+            int targetId = ((RecipientItem)comboRecipient.SelectedItem).Id;
+            Salakhova_Send(targetId, MT_DATA, textBoxMessage.Text);
+
+            txtOutput.AppendText($"[You -> {comboRecipient.SelectedItem}]: {textBoxMessage.Text}\r\n");
+            textBoxMessage.Clear();
+        }
+
+        private void PingTimer_Tick(object sender, EventArgs e)
+        {
+            if (Salakhova_IsConnected())
+            {
+                Salakhova_Send(ADDR_SERVER, MT_INFO, "");
+            }
+        }
+
+        private void PollTimer_Tick(object sender, EventArgs e)
+        {
+            int cmd, tgt, src;
+            while (Salakhova_Poll(out cmd, out tgt, out src, textBuf, textBuf.Capacity))
+            {
+                if (cmd == MT_CONFIRM)
+                {
+                    ParseClientList(textBuf.ToString());
+                }
+                else if (cmd == MT_DATA)
+                {
+                    txtOutput.AppendText($"[From Client #{src}]: {textBuf}\r\n");
+                }
+            }
+
+            if (!Salakhova_IsConnected())
+            {
+                pollTimer.Stop();
+                pingTimer.Stop();
+                ToggleUi(false);
+                MessageBox.Show("Connection to server lost!", "Disconnected", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+
+        private void ParseClientList(string payload)
+        {
+            // Если payload — это одно число без ':' (наш ID от сервера)
+            if (!payload.Contains(":") && int.TryParse(payload, out int assignedId))
+            {
+                myId = assignedId;
+                return;
+            }
+
+            int prevId = -999;
+            if (comboRecipient.SelectedItem != null)
+                prevId = ((RecipientItem)comboRecipient.SelectedItem).Id;
+
+            comboRecipient.Items.Clear();
+            comboRecipient.Items.Add(new RecipientItem("All (Broadcast)", ADDR_BROADCAST));
+
+            if (!string.IsNullOrWhiteSpace(payload))
+            {
+                string[] clients = payload.Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries);
+                foreach (var c in clients)
+                {
+                    string[] parts = c.Split(':');
+                    if (parts.Length >= 2 && int.TryParse(parts[0], out int id))
+                    {
+                        string label = (id == myId) ? $"Client #{id} (You)" : $"Client #{id}";
+                        comboRecipient.Items.Add(new RecipientItem(label, id));
+                    }
+                }
+            }
+
+            bool found = false;
+            foreach (RecipientItem item in comboRecipient.Items)
+            {
+                if (item.Id == prevId) { comboRecipient.SelectedItem = item; found = true; break; }
+            }
+            if (!found && comboRecipient.Items.Count > 0) comboRecipient.SelectedIndex = 0;
+        }
+
+        private void DisconnectClient()
+        {
+            if (Salakhova_IsConnected())
+            {
+                Salakhova_Send(ADDR_SERVER, MT_QUIT, "");
+                Salakhova_Disconnect();
+                pollTimer.Stop();
+                pingTimer.Stop();
+                ToggleUi(false);
+                comboRecipient.Items.Clear();
+            }
         }
 
         private void Form1_FormClosing(object sender, FormClosingEventArgs e)
         {
-            pollTimer.Stop();
-            Salakhova_Disconnect();
+            DisconnectClient();
         }
+    }
+
+    public class RecipientItem
+    {
+        public string Name { get; }
+        public int Id { get; }
+        public RecipientItem(string name, int id) { Name = name; Id = id; }
+        public override string ToString() => Name;
     }
 }
