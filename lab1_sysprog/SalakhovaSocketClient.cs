@@ -7,7 +7,7 @@ namespace Salakhova_Sharp
 {
     /// <summary>
     /// Socket-клиент для протокола Салаховой.
-    /// Замена Salakhova_Transport.dll — работает напрямую через System.Net.Sockets.Socket.
+    /// Socket-клиент для протокола Салаховой (без DLL, через System.Net.Sockets.Socket).
     /// 
     /// Формат заголовка (16 байт, little-endian int32):
     ///   [0..3]  - messageType (int)

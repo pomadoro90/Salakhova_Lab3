@@ -18,7 +18,7 @@
 #include "Salakhova_ThreadManager.h"
 #include "Salakhova_SysProgh.h"
 #include "Salakhova_Session.h"
-#include "../Salakhova_Transport/Salakhova_SocketTransport.h"
+#include "Salakhova_SocketTransport.h"
 
 using namespace boost::asio;
 using boost::asio::ip::tcp;
