@@ -1,9 +1,9 @@
 #pragma once
-#include <windows.h>
 #include <map>
 #include <mutex>
 #include <thread>
 #include <vector>
+#include <memory>
 #include "Salakhova_Session.h"
 #include "Salakhova_Interfaces.h"
 
@@ -15,11 +15,10 @@ class SRLocal : public ITransport
 public:
     int id;
 
-    static map<int, Session*> sessions_map;
+    static map<int, shared_ptr<Session>> sessions_map;
     static mutex mx;
     static vector<thread> threads;
-    static CRITICAL_SECTION threadOpMx;
-    static bool csInited;
+    static mutex threadOpMx;
 
     SRLocal(int id = -1);
 
@@ -29,7 +28,8 @@ public:
     static void addThread(int sessionID);
     static void removeLastThread();
     static int  threadCount();
-    static Session* getSession(int id);
+    static shared_ptr<Session> getSession(int id);
+    static wstring getThreadIds();
 };
 
-void MyThread(LPVOID lpParameter);
+void MyThread(shared_ptr<Session> session);

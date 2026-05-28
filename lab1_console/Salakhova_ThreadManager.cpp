@@ -2,12 +2,12 @@
 #include "Salakhova_SysProgh.h"
 #include <iostream>
 #include <fstream>
+#include <sstream>
 
-map<int, Session*> SRLocal::sessions_map;
+map<int, shared_ptr<Session>> SRLocal::sessions_map;
 mutex SRLocal::mx;
 vector<thread> SRLocal::threads;
-CRITICAL_SECTION SRLocal::threadOpMx;
-bool SRLocal::csInited = false;
+mutex SRLocal::threadOpMx;
 
 SRLocal::SRLocal(int id) : id(id) {}
 
@@ -21,26 +21,29 @@ void SRLocal::send(Message& m)
     }
     else
     {
-        if (sessions_map.find(m.header.to) != sessions_map.end())
-            sessions_map[m.header.to]->addMessage(m);
+        auto it = sessions_map.find(m.header.to);
+        if (it != sessions_map.end())
+            it->second->addMessage(m);
     }
 }
 
 void SRLocal::receive(Message& m)
 {
-    Session* targetSession = nullptr;
+    shared_ptr<Session> targetSession;
     {
         lock_guard<mutex> lg(mx);
-        targetSession = sessions_map[id];
+        auto it = sessions_map.find(id);
+        if (it != sessions_map.end())
+            targetSession = it->second;
     }
 
-    if (targetSession != nullptr)
+    if (targetSession)
     {
         targetSession->getMessage(m);
     }
 }
 
-Session* SRLocal::getSession(int id)
+shared_ptr<Session> SRLocal::getSession(int id)
 {
     lock_guard<mutex> lg(mx);
     auto it = sessions_map.find(id);
@@ -53,67 +56,60 @@ int SRLocal::threadCount()
     return (int)sessions_map.size();
 }
 
+wstring SRLocal::getThreadIds()
+{
+    lock_guard<mutex> lg(mx);
+    if (sessions_map.empty()) return L"";
+
+    wostringstream oss;
+    bool first = true;
+    for (const auto& pair : sessions_map)
+    {
+        if (!first) oss << L",";
+        oss << pair.first;
+        first = false;
+    }
+    return oss.str();
+}
+
 void SRLocal::addThread(int sessionID)
 {
-    if (!csInited)
+    auto s = make_shared<Session>(sessionID);
     {
-        InitializeCriticalSection(&threadOpMx);
-        csInited = true;
+        lock_guard<mutex> lg(mx);
+        sessions_map[sessionID] = s;
     }
-    EnterCriticalSection(&threadOpMx);
-    threads.emplace_back(MyThread, (LPVOID)new Session(sessionID));
-    LeaveCriticalSection(&threadOpMx);
+
+    lock_guard<mutex> lg(threadOpMx);
+    threads.emplace_back(MyThread, s);
 }
 
 void SRLocal::removeLastThread()
 {
-    if (!csInited)
-    {
-        InitializeCriticalSection(&threadOpMx);
-        csInited = true;
-    }
-    EnterCriticalSection(&threadOpMx);
-
-    if (threads.empty())
-    {
-        LeaveCriticalSection(&threadOpMx);
-        return;
-    }
-
     int idToClose = -1;
+
     {
         lock_guard<mutex> lg(mx);
-        if (!sessions_map.empty())
-            idToClose = sessions_map.rbegin()->first;
+        if (sessions_map.empty()) return;
+        idToClose = sessions_map.rbegin()->first;
     }
 
-    if (idToClose >= 0)
+    auto s = getSession(idToClose);
+    if (s)
     {
-        Session* s = getSession(idToClose);
-        if (s)
-        {
-            Message m(idToClose, MT_CLOSE);
-            s->addMessage(m);
-        }
+        Message m(idToClose, MT_CLOSE);
+        s->addMessage(m);
     }
 
+    lock_guard<mutex> lg(threadOpMx);
     if (threads.back().joinable())
         threads.back().join();
     threads.pop_back();
-
-    LeaveCriticalSection(&threadOpMx);
 }
 
-void MyThread(LPVOID lpParameter)
+void MyThread(shared_ptr<Session> session)
 {
-    auto* session = static_cast<Session*>(lpParameter);
     int id = session->sessionID;
-
-    // Добавляем сессию в карту
-    {
-        lock_guard<mutex> lg(SRLocal::mx);
-        SRLocal::sessions_map[id] = session;
-    }
 
     SafeWrite(L"session", id, L"is created.");
 
@@ -133,7 +129,6 @@ void MyThread(LPVOID lpParameter)
                 SRLocal::sessions_map.erase(id);
             }
 
-            delete session;
             return;
         }
         case MT_DATA:

@@ -25,7 +25,7 @@ namespace
     int g_nextSessionId = 0;
     std::mutex g_sessionIdMx;
 
-    int handleCommand(const Message& msg, bool& threadsChanged)
+    wstring handleCommand(const Message& msg, bool& threadsChanged)
     {
         threadsChanged = false;
 
@@ -49,10 +49,6 @@ namespace
                 if (SRLocal::threadCount() > 0)
                 {
                     SRLocal::removeLastThread();
-                    {
-                        std::lock_guard<std::mutex> lg(g_sessionIdMx);
-                        if (g_nextSessionId > 0) --g_nextSessionId;
-                    }
                     threadsChanged = true;
                 }
                 break;
@@ -76,7 +72,7 @@ namespace
             copy.send(&local);
         }
 
-        return SRLocal::threadCount();
+        return SRLocal::getThreadIds();
     }
 
     void clientWorker(std::shared_ptr<tcp::socket> sock)
@@ -84,9 +80,9 @@ namespace
         int peerId = ServerTransport::add(sock);
         SafeWrite(L"[server] client", peerId, L"connected");
 
-        // Отправляем количество активных потоков при подключении
-        int initialCount = SRLocal::threadCount();
-        Message confirmMsg(SR_BROKER, MT_CONFIRM, std::to_wstring(initialCount), peerId);
+        // Отправляем список ID активных потоков при подключении
+        wstring initialIds = SRLocal::getThreadIds();
+        Message confirmMsg(SR_BROKER, MT_CONFIRM, initialIds, peerId);
         ServerTransport::sendTo(peerId, confirmMsg);
 
         std::mutex writeMx;
@@ -101,16 +97,16 @@ namespace
                 msg.receive(&tr);
 
                 bool threadsChanged = false;
-                int count = handleCommand(msg, threadsChanged);
+                wstring ids = handleCommand(msg, threadsChanged);
 
-                // Подтверждение каждому клиенту
-                Message confirm(SR_BROKER, MT_CONFIRM, std::to_wstring(count), peerId);
+                // Подтверждение каждому клиенту — список ID потоков
+                Message confirm(SR_BROKER, MT_CONFIRM, ids, peerId);
                 ServerTransport::sendTo(peerId, confirm);
 
-                // Если количество потоков изменилось — оповестить всех
+                // Если количество потоков изменилось — оповестить всех остальных
                 if (threadsChanged)
                 {
-                    Message bcast(SR_BROKER, MT_CONFIRM, std::to_wstring(count));
+                    Message bcast(SR_BROKER, MT_CONFIRM, ids);
                     ServerTransport::broadcast(bcast);
                 }
             }
@@ -131,10 +127,6 @@ int wmain()
     _setmode(_fileno(stderr), _O_U16TEXT);
 
     SafeWrite(L"[server] Салахова Lab3 server on port", kPort);
-
-    SRLocal::csInited = false;
-    InitializeCriticalSection(&SRLocal::threadOpMx);
-    SRLocal::csInited = true;
 
     try
     {
