@@ -134,7 +134,7 @@ void MyThread(shared_ptr<Session> session)
         case MT_DATA:
         {
             wstring fileName = to_wstring(id) + L".txt";
-            wofstream fout(fileName, ios::app);
+            wofstream fout(fileName.c_str(), ios::app);
             fout.imbue(locale("ru_RU.UTF-8"));
             fout << m.data << endl;
             fout.close();
