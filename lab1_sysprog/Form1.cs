@@ -1,47 +1,19 @@
-﻿using System;
-using System.Runtime.InteropServices;
-using System.Text;
+using System;
 using System.Windows.Forms;
 
 namespace Salakhova_Sharp
 {
     public partial class Form1 : Form
     {
-        [DllImport("Salakhova_Transport.dll", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode)]
-        public static extern bool Salakhova_Connect(string host, int port);
-
-        [DllImport("Salakhova_Transport.dll", CallingConvention = CallingConvention.Cdecl)]
-        public static extern void Salakhova_Disconnect();
-
-        [DllImport("Salakhova_Transport.dll", CallingConvention = CallingConvention.Cdecl)]
-        public static extern bool Salakhova_IsConnected();
-
-        [DllImport("Salakhova_Transport.dll", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode)]
-        public static extern void Salakhova_Send(int target, int command, string text);
-
-        [DllImport("Salakhova_Transport.dll", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode)]
-        public static extern bool Salakhova_Poll(out int command, out int target, out int source, StringBuilder textBuf, int capacity);
-
-        const int MT_CLOSE = 0;
-        const int MT_DATA = 1;
-        const int MT_QUIT = 4;
-        const int MT_INFO = 5;
-        const int MT_CONFIRM = 6;
-        const int ADDR_BROADCAST = -1;
-        const int ADDR_SERVER = -2;
-        const int SERVER_TIMEOUT_SECONDS = 30;
-        const int CLIENT_PING_INTERVAL_SEC = 10;
-
+        private SalakhovaSocketClient client = new SalakhovaSocketClient();
         private int myId = -1;
         private System.Windows.Forms.Timer pollTimer;
         private System.Windows.Forms.Timer pingTimer;
-        private StringBuilder textBuf = new StringBuilder(4096);
 
         public Form1()
         {
             InitializeComponent();
             this.FormClosing += Form1_FormClosing;
-
             this.Text = "Message Client";
 
             pollTimer = new System.Windows.Forms.Timer();
@@ -49,7 +21,7 @@ namespace Salakhova_Sharp
             pollTimer.Tick += PollTimer_Tick;
 
             pingTimer = new System.Windows.Forms.Timer();
-            pingTimer.Interval = CLIENT_PING_INTERVAL_SEC * 1000;
+            pingTimer.Interval = 10000; // 10 секунд
             pingTimer.Tick += PingTimer_Tick;
 
             ToggleUi(false);
@@ -66,16 +38,29 @@ namespace Salakhova_Sharp
 
         private void btnConnect_Click(object sender, EventArgs e)
         {
-            if (Salakhova_Connect("127.0.0.1", 12345))
+            string host = string.IsNullOrWhiteSpace(txtHost.Text) ? "127.0.0.1" : txtHost.Text;
+            int port = (int)numericPort.Value;
+
+            try
             {
-                pollTimer.Start();
-                pingTimer.Start();
-                ToggleUi(true);
+                if (!client.Connect(host, port))
+                {
+                    MessageBox.Show("Server rejected connection!", "Connection Error",
+                        MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return;
+                }
             }
-            else
+            catch (Exception ex)
             {
-                MessageBox.Show("Server is not running!", "Connection Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                MessageBox.Show($"Connection error: {ex.Message}", "Connection Error",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
             }
+
+            myId = client.ClientId;
+            pollTimer.Start();
+            pingTimer.Start();
+            ToggleUi(true);
         }
 
         private void btnDisconnect_Click(object sender, EventArgs e)
@@ -85,45 +70,47 @@ namespace Salakhova_Sharp
 
         private void btnSend_Click(object sender, EventArgs e)
         {
-            if (!Salakhova_IsConnected() || string.IsNullOrWhiteSpace(textBoxMessage.Text)) return;
+            if (!client.IsConnected || string.IsNullOrWhiteSpace(textBoxMessage.Text)) return;
             if (comboRecipient.SelectedItem == null) return;
 
             int targetId = ((RecipientItem)comboRecipient.SelectedItem).Id;
-            Salakhova_Send(targetId, MT_DATA, textBoxMessage.Text);
-
+            client.Send(targetId, SalakhovaSocketClient.MT_DATA, textBoxMessage.Text);
             txtOutput.AppendText($"[You -> {comboRecipient.SelectedItem}]: {textBoxMessage.Text}\r\n");
             textBoxMessage.Clear();
         }
 
         private void PingTimer_Tick(object sender, EventArgs e)
         {
-            if (Salakhova_IsConnected())
+            if (client.IsConnected)
             {
-                Salakhova_Send(ADDR_SERVER, MT_INFO, "");
+                client.Send(SalakhovaSocketClient.ADDR_SERVER, SalakhovaSocketClient.MT_INFO, "");
             }
         }
 
         private void PollTimer_Tick(object sender, EventArgs e)
         {
-            int cmd, tgt, src;
-            while (Salakhova_Poll(out cmd, out tgt, out src, textBuf, textBuf.Capacity))
+            int src, cmd, tgt;
+            string text;
+
+            while (client.Poll(out src, out cmd, out tgt, out text))
             {
-                if (cmd == MT_CONFIRM)
+                if (cmd == SalakhovaSocketClient.MT_CONFIRM)
                 {
-                    ParseClientList(textBuf.ToString());
+                    ParseClientList(text);
                 }
-                else if (cmd == MT_DATA)
+                else if (cmd == SalakhovaSocketClient.MT_DATA)
                 {
-                    txtOutput.AppendText($"[From Client #{src}]: {textBuf}\r\n");
+                    txtOutput.AppendText($"[From Client #{src}]: {text}\r\n");
                 }
             }
 
-            if (!Salakhova_IsConnected())
+            if (!client.IsConnected)
             {
                 pollTimer.Stop();
                 pingTimer.Stop();
                 ToggleUi(false);
-                MessageBox.Show("Connection to server lost!", "Disconnected", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show("Connection to server lost!", "Disconnected",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
         }
 
@@ -141,7 +128,7 @@ namespace Salakhova_Sharp
                 prevId = ((RecipientItem)comboRecipient.SelectedItem).Id;
 
             comboRecipient.Items.Clear();
-            comboRecipient.Items.Add(new RecipientItem("All (Broadcast)", ADDR_BROADCAST));
+            comboRecipient.Items.Add(new RecipientItem("All (Broadcast)", SalakhovaSocketClient.ADDR_BROADCAST));
 
             if (!string.IsNullOrWhiteSpace(payload))
             {
@@ -167,10 +154,9 @@ namespace Salakhova_Sharp
 
         private void DisconnectClient()
         {
-            if (Salakhova_IsConnected())
+            if (client.IsConnected)
             {
-                Salakhova_Send(ADDR_SERVER, MT_QUIT, "");
-                Salakhova_Disconnect();
+                client.Disconnect();
                 pollTimer.Stop();
                 pingTimer.Stop();
                 ToggleUi(false);
